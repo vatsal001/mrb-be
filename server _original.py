@@ -3,8 +3,6 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from fastapi import APIRouter, HTTPException, Depends, Body
-import socket
 import os
 import logging
 from pathlib import Path
@@ -354,92 +352,52 @@ def generate_barcode_image(code: str) -> str:
     return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
 
+from fastapi import Body as _Body
+import socket as _socket
+
+# ═════════════════════════════════════════════════════════════
+#  THERMAL PRINTER  (TSC / TSPL)
+#  Set THERMAL_PRINTER_IP and THERMAL_PRINTER_PORT in .env
+# ═════════════════════════════════════════════════════════════
+
 @api_router.post("/print-thermal")
 async def print_thermal(
-    data: dict = Body(...),
+    data: dict = _Body(...),
     current_user: User = Depends(get_current_user)
 ):
     """
-    Send TSPL commands to a TSC TE144 (or any TSC/Zebra) thermal label
-    printer over TCP/IP (raw port 9100).
- 
-    Required .env keys:
-        THERMAL_PRINTER_IP   = 192.168.x.x
-        THERMAL_PRINTER_PORT = 9100          (default)
- 
-    ENCODING NOTE:
-        TSC TE144 firmware uses Latin-1 (cp1252).
-        We encode with  errors="replace"  so the ₹ rupee sign (U+20B9),
-        which has no cp1252 equivalent, becomes "?" without crashing.
-        The frontend already substitutes "Rs." for ₹ in TSPL TEXT commands,
-        so this is only a safety net.
- 
-    TIMEOUT:
-        5 s connect + 10 s send — adequate for a local LAN printer.
-        Increase THERMAL_PRINTER_TIMEOUT in .env for slower networks.
+    Send TSPL commands to a TSC thermal label printer over TCP/IP (port 9100).
+    Add to your .env:
+        THERMAL_PRINTER_IP   = 192.168.x.x   (your printer's IP)
+        THERMAL_PRINTER_PORT = 9100           (default for most TSC printers)
     """
-    PRINTER_IP   = os.environ.get("THERMAL_PRINTER_IP", "").strip()
+    PRINTER_IP   = os.environ.get("THERMAL_PRINTER_IP", "")
     PRINTER_PORT = int(os.environ.get("THERMAL_PRINTER_PORT", "9100"))
-    TIMEOUT      = float(os.environ.get("THERMAL_PRINTER_TIMEOUT", "10"))
- 
+
     if not PRINTER_IP:
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Thermal printer not configured. "
-                "Add THERMAL_PRINTER_IP to your .env file "
-                "(e.g.  THERMAL_PRINTER_IP=192.168.1.100)."
-            ),
+            detail="Thermal printer not configured. Add THERMAL_PRINTER_IP to your .env file."
         )
- 
-    commands: str = data.get("commands", "").strip()
+
+    commands = data.get("commands", "")
     if not commands:
-        raise HTTPException(status_code=400, detail="No TSPL commands provided.")
- 
-    # ── Encode for TSC firmware ───────────────────────────────
-    #  latin-1 / cp1252  — NOT utf-8
-    #  errors="replace" turns any unmappable char (e.g. ₹) into "?"
+        raise HTTPException(status_code=400, detail="No TSPL commands provided")
+
     try:
-        payload: bytes = commands.encode("latin-1", errors="replace")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"TSPL encoding error: {exc}")
- 
-    # ── TCP send ──────────────────────────────────────────────
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(TIMEOUT)
-    try:
-        sock.connect((PRINTER_IP, PRINTER_PORT))
-        # sendall() retries until all bytes are written (important for large jobs)
-        sock.sendall(payload)
-        return {
-            "status": "ok",
-            "printer": f"{PRINTER_IP}:{PRINTER_PORT}",
-            "bytes_sent": len(payload),
-        }
-    except socket.timeout:
-        raise HTTPException(
-            status_code=504,
-            detail=f"Printer at {PRINTER_IP}:{PRINTER_PORT} timed out after {TIMEOUT}s. "
-                   "Check the printer is on and connected to the same network.",
-        )
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect((PRINTER_IP, PRINTER_PORT))
+        s.send(commands.encode("utf-8"))
+        s.close()
+        return {"status": "ok", "printer": PRINTER_IP}
+    except _socket.timeout:
+        raise HTTPException(status_code=504, detail=f"Printer at {PRINTER_IP} timed out")
     except ConnectionRefusedError:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Connection refused by printer at {PRINTER_IP}:{PRINTER_PORT}. "
-                   "Ensure port 9100 is open on the printer (Interface → TCP/IP settings).",
-        )
-    except OSError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Network error reaching printer at {PRINTER_IP}: {exc}",
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Unexpected print error: {exc}")
-    finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
+        raise HTTPException(status_code=503, detail=f"Cannot connect to printer at {PRINTER_IP}:{PRINTER_PORT}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Print error: {str(e)}")
+
 
 # ═════════════════════════════════════════════════════════════
 #  AUTH ENDPOINTS
