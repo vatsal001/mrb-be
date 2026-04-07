@@ -3,8 +3,6 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from fastapi import APIRouter, HTTPException, Depends, Body
-import socket
 import os
 import logging
 from pathlib import Path
@@ -50,6 +48,44 @@ def require_roles(user, allowed: list, detail: str = "Access denied"):
     if user.role not in allowed:
         raise HTTPException(status_code=403, detail=detail)
 
+
+
+class AttendanceRecord(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    user_name: str
+    date: str                           # YYYY-MM-DD
+    clock_in: Optional[str] = None      # ISO datetime string
+    clock_out: Optional[str] = None     # ISO datetime string
+    duration_minutes: Optional[int] = None
+    status: str = "present"             # 'present' | 'half_day' | 'on_leave'
+    notes: Optional[str] = ""
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class LeaveRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    user_name: str
+    date_from: str                      # YYYY-MM-DD
+    date_to: str                        # YYYY-MM-DD (same as date_from for single day)
+    days_count: int = 1
+    leave_type: str                     # 'sick' | 'casual' | 'emergency' | 'other'
+    reason: str
+    status: str = "pending"             # 'pending' | 'approved' | 'rejected'
+    reviewed_by_id: Optional[str] = None
+    reviewed_by_name: Optional[str] = None
+    reviewed_at: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class LeaveRequestCreate(BaseModel):
+    date_from: str
+    date_to: str
+    leave_type: str
+    reason: str
 
 class UserRole(str, Enum):
     ADMIN   = "admin"
@@ -310,6 +346,23 @@ class ProductLocationThreshold(BaseModel):
     mall_threshold: int = 5
     warehouse_threshold: int = 20
 
+# ─── Normal Helpers ─────────────────────────────────────────────
+
+def _count_working_days(date_from: str, date_to: str) -> int:
+    """Count calendar days between two dates inclusive."""
+    from datetime import date as dt_date
+    d1 = dt_date.fromisoformat(date_from)
+    d2 = dt_date.fromisoformat(date_to)
+    return max(1, (d2 - d1).days + 1)
+
+
+def _today_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 # ─── Auth Helpers ─────────────────────────────────────────────
 
@@ -353,93 +406,6 @@ def generate_barcode_image(code: str) -> str:
     buffer.seek(0)
     return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
-
-@api_router.post("/print-thermal")
-async def print_thermal(
-    data: dict = Body(...),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Send TSPL commands to a TSC TE144 (or any TSC/Zebra) thermal label
-    printer over TCP/IP (raw port 9100).
- 
-    Required .env keys:
-        THERMAL_PRINTER_IP   = 192.168.x.x
-        THERMAL_PRINTER_PORT = 9100          (default)
- 
-    ENCODING NOTE:
-        TSC TE144 firmware uses Latin-1 (cp1252).
-        We encode with  errors="replace"  so the ₹ rupee sign (U+20B9),
-        which has no cp1252 equivalent, becomes "?" without crashing.
-        The frontend already substitutes "Rs." for ₹ in TSPL TEXT commands,
-        so this is only a safety net.
- 
-    TIMEOUT:
-        5 s connect + 10 s send — adequate for a local LAN printer.
-        Increase THERMAL_PRINTER_TIMEOUT in .env for slower networks.
-    """
-    PRINTER_IP   = os.environ.get("THERMAL_PRINTER_IP", "").strip()
-    PRINTER_PORT = int(os.environ.get("THERMAL_PRINTER_PORT", "9100"))
-    TIMEOUT      = float(os.environ.get("THERMAL_PRINTER_TIMEOUT", "10"))
- 
-    if not PRINTER_IP:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Thermal printer not configured. "
-                "Add THERMAL_PRINTER_IP to your .env file "
-                "(e.g.  THERMAL_PRINTER_IP=192.168.1.100)."
-            ),
-        )
- 
-    commands: str = data.get("commands", "").strip()
-    if not commands:
-        raise HTTPException(status_code=400, detail="No TSPL commands provided.")
- 
-    # ── Encode for TSC firmware ───────────────────────────────
-    #  latin-1 / cp1252  — NOT utf-8
-    #  errors="replace" turns any unmappable char (e.g. ₹) into "?"
-    try:
-        payload: bytes = commands.encode("latin-1", errors="replace")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"TSPL encoding error: {exc}")
- 
-    # ── TCP send ──────────────────────────────────────────────
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(TIMEOUT)
-    try:
-        sock.connect((PRINTER_IP, PRINTER_PORT))
-        # sendall() retries until all bytes are written (important for large jobs)
-        sock.sendall(payload)
-        return {
-            "status": "ok",
-            "printer": f"{PRINTER_IP}:{PRINTER_PORT}",
-            "bytes_sent": len(payload),
-        }
-    except socket.timeout:
-        raise HTTPException(
-            status_code=504,
-            detail=f"Printer at {PRINTER_IP}:{PRINTER_PORT} timed out after {TIMEOUT}s. "
-                   "Check the printer is on and connected to the same network.",
-        )
-    except ConnectionRefusedError:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Connection refused by printer at {PRINTER_IP}:{PRINTER_PORT}. "
-                   "Ensure port 9100 is open on the printer (Interface → TCP/IP settings).",
-        )
-    except OSError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Network error reaching printer at {PRINTER_IP}: {exc}",
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Unexpected print error: {exc}")
-    finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
 
 # ═════════════════════════════════════════════════════════════
 #  AUTH ENDPOINTS
@@ -514,8 +480,7 @@ async def create_product(
     require_roles(current_user, ['admin', 'manager'],
                   "Only admins and managers can create products")
 
-    # Use SKU as the barcode so printed labels and scanner always match
-    barcode_num = product_data.sku.strip() if product_data.sku.strip() else str(uuid.uuid4().int)[:12]
+    barcode_num = str(uuid.uuid4().int)[:12]
     product = Product(**product_data.model_dump(), barcode=barcode_num)
     doc = product.model_dump()
     doc['created_at'] = doc['created_at'].isoformat()
@@ -535,12 +500,7 @@ async def get_product(product_id: str, current_user: User = Depends(get_current_
 
 @api_router.get("/products/barcode/{barcode_num}")
 async def get_product_by_barcode(barcode_num: str, current_user: User = Depends(get_current_user)):
-    # Search by barcode field first, then fall back to SKU field
-    # This allows scanning both auto-generated barcodes AND manually entered SKU codes (e.g. from Vyapar)
-    product = await db.products.find_one(
-        {'$or': [{'barcode': barcode_num}, {'sku': barcode_num}]},
-        {'_id': 0}
-    )
+    product = await db.products.find_one({'barcode': barcode_num}, {'_id': 0})
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
     if isinstance(product.get('created_at'), str):
@@ -588,16 +548,6 @@ async def get_barcode_image(product_id: str, current_user: User = Depends(get_cu
         raise HTTPException(status_code=404, detail="Product not found")
     barcode_img = generate_barcode_image(product['barcode'])
     return {'barcode_image': f'data:image/png;base64,{barcode_img}'}
-
-
-@api_router.get("/barcode-preview/{code}")
-async def preview_barcode_image(code: str, current_user: User = Depends(get_current_user)):
-    """Generate a barcode image for ANY code — used for live preview before product is saved."""
-    try:
-        barcode_img = generate_barcode_image(code.strip())
-        return {'barcode_image': f'data:image/png;base64,{barcode_img}'}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Cannot generate barcode for this code: {str(e)}")
 
 
 # ═════════════════════════════════════════════════════════════
@@ -1472,6 +1422,334 @@ async def delete_daybook_entry(entry_id: str, current_user: User = Depends(get_c
 
     await db.daybook.delete_one({'id': entry_id})
     return {'message': 'Entry deleted successfully'}
+
+
+# ══════════════════════════════════════════════════════════════
+#  ATTENDANCE ENDPOINTS
+# ══════════════════════════════════════════════════════════════
+
+@api_router.post("/attendance/clock-in")
+async def clock_in(current_user: User = Depends(get_current_user)):
+    """Mark clock-in for today. Only one clock-in per day per user."""
+    today = _today_str()
+
+    existing = await db.attendance.find_one(
+        {"user_id": current_user.id, "date": today}, {"_id": 0}
+    )
+    if existing:
+        if existing.get("clock_in"):
+            raise HTTPException(status_code=400, detail="Already clocked in today")
+    
+    now = _now_iso()
+    record = AttendanceRecord(
+        user_id=current_user.id,
+        user_name=current_user.name,
+        date=today,
+        clock_in=now,
+        status="present",
+    )
+    doc = record.model_dump()
+    doc["created_at"] = doc["created_at"].isoformat()
+    await db.attendance.insert_one(doc)
+    return {"message": "Clocked in successfully", "clock_in": now, "record_id": record.id}
+
+
+@api_router.post("/attendance/clock-out")
+async def clock_out(current_user: User = Depends(get_current_user)):
+    """Mark clock-out for today."""
+    today = _today_str()
+
+    record = await db.attendance.find_one(
+        {"user_id": current_user.id, "date": today}, {"_id": 0}
+    )
+    if not record:
+        raise HTTPException(status_code=400, detail="You haven't clocked in today")
+    if record.get("clock_out"):
+        raise HTTPException(status_code=400, detail="Already clocked out today")
+
+    clock_in_dt = datetime.fromisoformat(record["clock_in"])
+    now_dt = datetime.now(timezone.utc)
+    duration = int((now_dt - clock_in_dt).total_seconds() / 60)
+
+    now = now_dt.isoformat()
+    await db.attendance.update_one(
+        {"user_id": current_user.id, "date": today},
+        {"$set": {"clock_out": now, "duration_minutes": duration}}
+    )
+    return {"message": "Clocked out successfully", "clock_out": now, "duration_minutes": duration}
+
+
+@api_router.get("/attendance/today")
+async def get_today_attendance(current_user: User = Depends(get_current_user)):
+    """Get today's attendance record for the current user."""
+    today = _today_str()
+    record = await db.attendance.find_one(
+        {"user_id": current_user.id, "date": today}, {"_id": 0}
+    )
+    # Also check if they have an approved leave for today
+    leave = await db.leaves.find_one(
+        {"user_id": current_user.id, "status": "approved",
+         "date_from": {"$lte": today}, "date_to": {"$gte": today}},
+        {"_id": 0}
+    )
+    return {
+        "record": record,
+        "on_approved_leave": leave is not None,
+        "leave": leave,
+        "today": today,
+    }
+
+
+@api_router.get("/attendance/my")
+async def get_my_attendance(
+    month: Optional[str] = None,   # format: YYYY-MM
+    current_user: User = Depends(get_current_user)
+):
+    """Get current user's attendance records, optionally filtered by month."""
+    query = {"user_id": current_user.id}
+    if month:
+        query["date"] = {"$regex": f"^{month}"}
+
+    records = await db.attendance.find(query, {"_id": 0}).sort("date", -1).to_list(500)
+    for r in records:
+        if isinstance(r.get("created_at"), str):
+            r["created_at"] = datetime.fromisoformat(r["created_at"])
+    return records
+
+
+@api_router.get("/attendance/summary")
+async def get_attendance_summary(
+    month: str,                     # format: YYYY-MM  e.g. 2026-03
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Admin/Manager only.
+    Returns per-staff attendance summary for the given month.
+    """
+    require_roles(current_user, ["admin", "manager"],
+                  "Only admins and managers can view attendance summary")
+
+    # Get all users
+    all_users = await db.users.find({}, {"_id": 0, "password": 0}).to_list(500)
+
+    # Get all attendance records for the month
+    records = await db.attendance.find(
+        {"date": {"$regex": f"^{month}"}}, {"_id": 0}
+    ).to_list(5000)
+
+    # Get all approved leaves for the month
+    leaves = await db.leaves.find(
+        {"status": "approved"}, {"_id": 0}
+    ).to_list(5000)
+
+    # Build per-user summary
+    summary = []
+    for user in all_users:
+        user_records = [r for r in records if r["user_id"] == user["id"]]
+
+        days_present   = len([r for r in user_records if r.get("clock_in") and r.get("clock_out")])
+        days_clocked_in_only = len([r for r in user_records if r.get("clock_in") and not r.get("clock_out")])
+
+        # Count approved leave days in this month
+        leave_days = 0
+        user_leaves = [l for l in leaves if l["user_id"] == user["id"]]
+        for leave in user_leaves:
+            # Count overlap with requested month
+            from datetime import date as dt_date
+            try:
+                d1 = max(dt_date.fromisoformat(leave["date_from"]), dt_date.fromisoformat(f"{month}-01"))
+                last_day = dt_date.fromisoformat(f"{month}-01").replace(day=28) + __import__('datetime').timedelta(days=4)
+                month_end = last_day - __import__('datetime').timedelta(days=last_day.day)
+                d2 = min(dt_date.fromisoformat(leave["date_to"]), month_end)
+                if d2 >= d1:
+                    leave_days += (d2 - d1).days + 1
+            except Exception:
+                pass
+
+        avg_duration = 0
+        durations = [r["duration_minutes"] for r in user_records if r.get("duration_minutes")]
+        if durations:
+            avg_duration = round(sum(durations) / len(durations))
+
+        summary.append({
+            "user_id":           user["id"],
+            "user_name":         user["name"],
+            "user_email":        user["email"],
+            "role":              user["role"],
+            "days_present":      days_present,
+            "days_clocked_in_only": days_clocked_in_only,
+            "days_on_leave":     leave_days,
+            "avg_duration_minutes": avg_duration,
+            "records":           user_records,
+        })
+
+    return {"month": month, "summary": summary}
+
+
+@api_router.get("/attendance/staff/{user_id}")
+async def get_staff_attendance(
+    user_id: str,
+    month: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    """Admin/Manager: get a specific staff member's attendance records."""
+    require_roles(current_user, ["admin", "manager"],
+                  "Only admins and managers can view staff attendance")
+
+    query = {"user_id": user_id}
+    if month:
+        query["date"] = {"$regex": f"^{month}"}
+
+    records = await db.attendance.find(query, {"_id": 0}).sort("date", -1).to_list(500)
+    for r in records:
+        if isinstance(r.get("created_at"), str):
+            r["created_at"] = datetime.fromisoformat(r["created_at"])
+    return records
+
+
+# ══════════════════════════════════════════════════════════════
+#  LEAVE ENDPOINTS
+# ══════════════════════════════════════════════════════════════
+
+@api_router.post("/leaves")
+async def request_leave(
+    leave_data: LeaveRequestCreate,
+    current_user: User = Depends(get_current_user)
+):
+    """Any staff can submit a leave request."""
+    if leave_data.leave_type not in ("sick", "casual", "emergency", "other"):
+        raise HTTPException(status_code=400, detail="Invalid leave type")
+    if not leave_data.reason.strip():
+        raise HTTPException(status_code=400, detail="Reason is required")
+
+    # Check for overlapping pending/approved leave
+    existing = await db.leaves.find_one({
+        "user_id": current_user.id,
+        "status":  {"$in": ["pending", "approved"]},
+        "date_from": {"$lte": leave_data.date_to},
+        "date_to":   {"$gte": leave_data.date_from},
+    }, {"_id": 0})
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="You already have a leave request overlapping these dates"
+        )
+
+    days = _count_working_days(leave_data.date_from, leave_data.date_to)
+
+    leave = LeaveRequest(
+        user_id=current_user.id,
+        user_name=current_user.name,
+        date_from=leave_data.date_from,
+        date_to=leave_data.date_to,
+        days_count=days,
+        leave_type=leave_data.leave_type,
+        reason=leave_data.reason.strip(),
+    )
+    doc = leave.model_dump()
+    doc["created_at"] = doc["created_at"].isoformat()
+    await db.leaves.insert_one(doc)
+    return leave
+
+
+@api_router.get("/leaves")
+async def get_leaves(
+    status: Optional[str] = None,
+    month:  Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    """Admin/Manager: all leaves. Staff: own leaves only."""
+    query = {}
+    if current_user.role not in ["admin", "manager"]:
+        query["user_id"] = current_user.id
+    if status:
+        query["status"] = status
+    if month:
+        query["date_from"] = {"$regex": f"^{month}"}
+
+    leaves = await db.leaves.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    for l in leaves:
+        if isinstance(l.get("created_at"), str):
+            l["created_at"] = datetime.fromisoformat(l["created_at"])
+    return leaves
+
+
+@api_router.put("/leaves/{leave_id}/approve")
+async def approve_leave(leave_id: str, current_user: User = Depends(get_current_user)):
+    require_roles(current_user, ["admin", "manager"], "Only admins/managers can approve leaves")
+
+    leave = await db.leaves.find_one({"id": leave_id}, {"_id": 0})
+    if not leave:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+    if leave["status"] != "pending":
+        raise HTTPException(status_code=400, detail=f"Leave is already {leave['status']}")
+
+    now = _now_iso()
+    await db.leaves.update_one({"id": leave_id}, {"$set": {
+        "status":           "approved",
+        "reviewed_by_id":   current_user.id,
+        "reviewed_by_name": current_user.name,
+        "reviewed_at":      now,
+    }})
+
+    # Create attendance records for the approved leave days
+    from datetime import date as dt_date, timedelta
+    d = dt_date.fromisoformat(leave["date_from"])
+    end = dt_date.fromisoformat(leave["date_to"])
+    while d <= end:
+        date_str = d.isoformat()
+        existing = await db.attendance.find_one(
+            {"user_id": leave["user_id"], "date": date_str}, {"_id": 0}
+        )
+        if not existing:
+            record = AttendanceRecord(
+                user_id=leave["user_id"],
+                user_name=leave["user_name"],
+                date=date_str,
+                status="on_leave",
+                notes=f"Approved {leave['leave_type']} leave",
+            )
+            rdoc = record.model_dump()
+            rdoc["created_at"] = rdoc["created_at"].isoformat()
+            await db.attendance.insert_one(rdoc)
+        d += timedelta(days=1)
+
+    return {"message": "Leave approved"}
+
+
+@api_router.put("/leaves/{leave_id}/reject")
+async def reject_leave(leave_id: str, current_user: User = Depends(get_current_user)):
+    require_roles(current_user, ["admin", "manager"], "Only admins/managers can reject leaves")
+
+    leave = await db.leaves.find_one({"id": leave_id}, {"_id": 0})
+    if not leave:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+    if leave["status"] != "pending":
+        raise HTTPException(status_code=400, detail=f"Leave is already {leave['status']}")
+
+    await db.leaves.update_one({"id": leave_id}, {"$set": {
+        "status":           "rejected",
+        "reviewed_by_id":   current_user.id,
+        "reviewed_by_name": current_user.name,
+        "reviewed_at":      _now_iso(),
+    }})
+    return {"message": "Leave rejected"}
+
+
+@api_router.delete("/leaves/{leave_id}")
+async def cancel_leave(leave_id: str, current_user: User = Depends(get_current_user)):
+    """Staff can cancel their own pending leave. Admin can cancel any."""
+    leave = await db.leaves.find_one({"id": leave_id}, {"_id": 0})
+    if not leave:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+    if current_user.role not in ["admin", "manager"] and leave["user_id"] != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if leave["status"] == "approved":
+        raise HTTPException(status_code=400, detail="Cannot cancel an approved leave. Contact admin.")
+
+    await db.leaves.delete_one({"id": leave_id})
+    return {"message": "Leave request cancelled"}
+
 
 
 # ─── App setup ────────────────────────────────────────────────
