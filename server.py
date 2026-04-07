@@ -27,7 +27,7 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-app = FastAPI()
+app = FastAPI() 
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
@@ -1783,15 +1783,20 @@ async def cancel_leave(leave_id: str, current_user: User = Depends(get_current_u
 
 
 # ─── App setup ────────────────────────────────────────────────
-app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=[
+        "https://mrb-a9i.pages.dev",   # your frontend
+        "http://localhost:5173",       # local vite
+        "http://localhost:3000"
+    ],
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(api_router)
 
 logging.basicConfig(
     level=logging.INFO,
