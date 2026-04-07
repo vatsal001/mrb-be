@@ -462,14 +462,44 @@ async def get_me(current_user: User = Depends(get_current_user)):
 #  DELETE → admin only
 # ═════════════════════════════════════════════════════════════
 
-@api_router.get("/products", response_model=List[Product])
-async def get_products(current_user: User = Depends(get_current_user)):
-    # All roles can view products
-    products = await db.products.find({}, {'_id': 0}).to_list(1000)
+@api_router.get("/products")
+async def get_products(
+    page: int = 1,
+    limit: int = 10,
+    search: str = "",
+    current_user: User = Depends(get_current_user)
+):
+    # Build search query
+    query = {}
+    if search:
+        query = {
+            "$or": [
+                {"name": {"$regex": search, "$options": "i"}},
+                {"sku": {"$regex": search, "$options": "i"}},
+                {"category": {"$regex": search, "$options": "i"}}
+            ]
+        }
+    
+    # Get total count for pagination
+    total = await db.products.count_documents(query)
+    
+    # Get paginated products
+    skip = (page - 1) * limit
+    products = await db.products.find(query, {'_id': 0}).skip(skip).limit(limit).to_list(limit)
+    
     for p in products:
         if isinstance(p.get('created_at'), str):
             p['created_at'] = datetime.fromisoformat(p['created_at'])
-    return products
+    
+    return {
+        "products": products,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "pages": (total + limit - 1) // limit
+        }
+    }
 
 
 @api_router.post("/products", response_model=Product)
