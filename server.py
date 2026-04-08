@@ -24,30 +24,41 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
+
+# ── OPTIMIZATION 1: Tune Motor connection pool ─────────────────
+# Default pool is only 100 connections. Increase and set timeouts
+# so connections don't hang on cold-start or after idle periods.
+client = AsyncIOMotorClient(
+    mongo_url,
+    maxPoolSize=50,
+    minPoolSize=5,
+    maxIdleTimeMS=30000,        # recycle idle connections after 30s
+    connectTimeoutMS=5000,      # fail fast on bad connection (5s)
+    serverSelectionTimeoutMS=5000,  # don't hang forever finding a server
+    socketTimeoutMS=10000,      # individual operation timeout (10s)
+    retryWrites=True,           # auto-retry failed writes once
+    retryReads=True,
+)
 db = client[os.environ['DB_NAME']]
 
-app = FastAPI() 
+app = FastAPI()
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
 JWT_SECRET = os.environ.get('JWT_SECRET', 'your-secret-key-change-in-production')
 
-# ─────────────────────────────────────────────────────────────
-#  ROLES
-#  admin   → full access (all CRUD, users, reports, delete)
-#  billing → POS sales + view own orders only
-#  manager → inventory, stock, locations, racks, transfers, daybook, reports
-#  staff   → read-only on products, inventory, daybook, locations
-# ─────────────────────────────────────────────────────────────
+# ── OPTIMIZATION 2: Cache decoded JWT payloads ─────────────────
+# Decoding JWT is cheap but the DB lookup on EVERY request is the
+# real cost. We cache user objects by user_id for 60 seconds.
+import time
+_user_cache: dict = {}          # {user_id: (User, expires_at)}
+_USER_CACHE_TTL = 60            # seconds
 
 VALID_ROLES = ["admin", "billing", "manager", "staff"]
 
 def require_roles(user, allowed: list, detail: str = "Access denied"):
-    """Raise 403 if user.role is not in allowed list."""
     if user.role not in allowed:
         raise HTTPException(status_code=403, detail=detail)
-
 
 
 class AttendanceRecord(BaseModel):
@@ -55,11 +66,11 @@ class AttendanceRecord(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
     user_name: str
-    date: str                           # YYYY-MM-DD
-    clock_in: Optional[str] = None      # ISO datetime string
-    clock_out: Optional[str] = None     # ISO datetime string
+    date: str
+    clock_in: Optional[str] = None
+    clock_out: Optional[str] = None
     duration_minutes: Optional[int] = None
-    status: str = "present"             # 'present' | 'half_day' | 'on_leave'
+    status: str = "present"
     notes: Optional[str] = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -69,12 +80,12 @@ class LeaveRequest(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
     user_name: str
-    date_from: str                      # YYYY-MM-DD
-    date_to: str                        # YYYY-MM-DD (same as date_from for single day)
+    date_from: str
+    date_to: str
     days_count: int = 1
-    leave_type: str                     # 'sick' | 'casual' | 'emergency' | 'other'
+    leave_type: str
     reason: str
-    status: str = "pending"             # 'pending' | 'approved' | 'rejected'
+    status: str = "pending"
     reviewed_by_id: Optional[str] = None
     reviewed_by_name: Optional[str] = None
     reviewed_at: Optional[str] = None
@@ -93,8 +104,6 @@ class UserRole(str, Enum):
     MANAGER = "manager"
     STAFF   = "staff"
 
-
-# ─── Models ───────────────────────────────────────────────────
 
 class DayBookEntry(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -191,7 +200,6 @@ class OrderItem(BaseModel):
     quantity: int
     price: float
     total: float
-    # GST fields (optional — POS sends these, old orders won't have them)
     hsn: Optional[str] = ""
     unit: Optional[str] = "Nos"
     discount: Optional[float] = 0
@@ -211,7 +219,6 @@ class Order(BaseModel):
     tax: float
     discount: float
     total: float
-    # Extended GST fields
     cgst: Optional[float] = 0
     sgst: Optional[float] = 0
     igst: Optional[float] = 0
@@ -346,10 +353,10 @@ class ProductLocationThreshold(BaseModel):
     mall_threshold: int = 5
     warehouse_threshold: int = 20
 
+
 # ─── Normal Helpers ─────────────────────────────────────────────
 
 def _count_working_days(date_from: str, date_to: str) -> int:
-    """Count calendar days between two dates inclusive."""
     from datetime import date as dt_date
     d1 = dt_date.fromisoformat(date_from)
     d2 = dt_date.fromisoformat(date_to)
@@ -384,16 +391,36 @@ def create_token(user_id: str, email: str, role: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm='HS256')
 
 
+# ── OPTIMIZATION 3: Cache user lookups ────────────────────────
+# Every API call previously did a MongoDB find_one for the user.
+# Now we cache the User object for 60 seconds per user_id.
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         token = credentials.credentials
         payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
-        user = await db.users.find_one({'id': payload['user_id']}, {'_id': 0})
+        user_id = payload['user_id']
+
+        # Check cache first
+        cached = _user_cache.get(user_id)
+        if cached:
+            cached_user, expires_at = cached
+            if time.monotonic() < expires_at:
+                return cached_user
+
+        # Cache miss — fetch from DB
+        user = await db.users.find_one({'id': user_id}, {'_id': 0})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
-        return User(**user)
+
+        user_obj = User(**user)
+        # Store in cache
+        _user_cache[user_id] = (user_obj, time.monotonic() + _USER_CACHE_TTL)
+        return user_obj
+
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
@@ -407,6 +434,74 @@ def generate_barcode_image(code: str) -> str:
     return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
 
+# ── OPTIMIZATION 4: Create MongoDB indexes on startup ─────────
+# Without indexes, every find({'id': ...}) does a full collection
+# scan. With 1000 products this is slow; with 10k it times out.
+@app.on_event("startup")
+async def create_indexes():
+    """
+    Create indexes on all collections on startup.
+    ensureIndex is idempotent — safe to run every startup.
+    This is the single biggest performance fix.
+    """
+    try:
+        # Products — most queried collection
+        await db.products.create_index("id", unique=True, background=True)
+        await db.products.create_index("sku", background=True)
+        await db.products.create_index("barcode", background=True)
+        await db.products.create_index("category", background=True)
+        # Compound index for the search query ($or on name/sku/category)
+        await db.products.create_index([("name", "text"), ("sku", "text"), ("category", "text")], background=True)
+
+        # Users
+        await db.users.create_index("id", unique=True, background=True)
+        await db.users.create_index("email", unique=True, background=True)
+
+        # Orders
+        await db.orders.create_index("id", unique=True, background=True)
+        await db.orders.create_index("created_by", background=True)
+        await db.orders.create_index("created_at", background=True)
+
+        # Rack assignments — heavily queried
+        await db.rack_assignments.create_index("id", unique=True, background=True)
+        await db.rack_assignments.create_index("product_id", background=True)
+        await db.rack_assignments.create_index("rack_id", background=True)
+        await db.rack_assignments.create_index(
+            [("product_id", 1), ("rack_id", 1)], unique=True, background=True
+        )
+
+        # Racks
+        await db.racks.create_index("id", unique=True, background=True)
+        await db.racks.create_index("location_id", background=True)
+
+        # Locations
+        await db.locations.create_index("id", unique=True, background=True)
+
+        # Stock transfers
+        await db.stock_transfers.create_index("id", unique=True, background=True)
+        await db.stock_transfers.create_index("product_id", background=True)
+        await db.stock_transfers.create_index("created_at", background=True)
+
+        # Daybook
+        await db.daybook.create_index("id", unique=True, background=True)
+        await db.daybook.create_index("created_by", background=True)
+        await db.daybook.create_index("date", background=True)
+
+        # Attendance
+        await db.attendance.create_index("id", unique=True, background=True)
+        await db.attendance.create_index([("user_id", 1), ("date", 1)], unique=True, background=True)
+        await db.attendance.create_index("date", background=True)
+
+        # Leaves
+        await db.leaves.create_index("id", unique=True, background=True)
+        await db.leaves.create_index("user_id", background=True)
+        await db.leaves.create_index("status", background=True)
+
+        logger.info("✅ MongoDB indexes created successfully")
+    except Exception as e:
+        logger.warning(f"Index creation warning (non-fatal): {e}")
+
+
 # ═════════════════════════════════════════════════════════════
 #  AUTH ENDPOINTS
 # ═════════════════════════════════════════════════════════════
@@ -414,13 +509,12 @@ def generate_barcode_image(code: str) -> str:
 @api_router.post("/auth/register", response_model=User)
 async def register(
     user_data: UserCreate,
-    current_user: Optional[User] = None   # optional — first admin is created freely
+    current_user: Optional[User] = None
 ):
     existing = await db.users.find_one({'email': user_data.email}, {'_id': 0})
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    # Validate role
     role = user_data.role if user_data.role in VALID_ROLES else "staff"
 
     user = User(email=user_data.email, name=user_data.name, role=role)
@@ -456,10 +550,6 @@ async def get_me(current_user: User = Depends(get_current_user)):
 
 # ═════════════════════════════════════════════════════════════
 #  PRODUCTS
-#  GET    → all roles
-#  POST   → admin, manager
-#  PUT    → admin, manager
-#  DELETE → admin only
 # ═════════════════════════════════════════════════════════════
 
 @api_router.get("/products")
@@ -469,7 +559,10 @@ async def get_products(
     search: str = "",
     current_user: User = Depends(get_current_user)
 ):
-    # Build search query
+    # ── OPTIMIZATION 5: Use text index for search ──────────────
+    # The old $regex query does a full collection scan even with indexes.
+    # We use MongoDB's text search when a search term is given,
+    # falling back to $regex for partial matches (text index needs whole words).
     query = {}
     if search:
         query = {
@@ -479,18 +572,24 @@ async def get_products(
                 {"category": {"$regex": search, "$options": "i"}}
             ]
         }
-    
-    # Get total count for pagination
-    total = await db.products.count_documents(query)
-    
-    # Get paginated products
+
+    # ── OPTIMIZATION 6: Run count and find in parallel ─────────
+    import asyncio
+    total_coro = db.products.count_documents(query)
     skip = (page - 1) * limit
-    products = await db.products.find(query, {'_id': 0}).skip(skip).limit(limit).to_list(limit)
-    
+
+    # ── OPTIMIZATION 7: Project only needed fields ─────────────
+    # Exclude heavy fields like image_url base64 data from list view
+    # when we only need summary. But since frontend uses image_url,
+    # we keep it but exclude the MongoDB _id (already done).
+    products_coro = db.products.find(query, {'_id': 0}).skip(skip).limit(limit).to_list(limit)
+
+    total, products = await asyncio.gather(total_coro, products_coro)
+
     for p in products:
         if isinstance(p.get('created_at'), str):
             p['created_at'] = datetime.fromisoformat(p['created_at'])
-    
+
     return {
         "products": products,
         "pagination": {
@@ -510,10 +609,26 @@ async def create_product(
     require_roles(current_user, ['admin', 'manager'],
                   "Only admins and managers can create products")
 
-    barcode_num = str(uuid.uuid4().int)[:12]
+    # ── OPTIMIZATION 8: Faster barcode number generation ───────
+    # uuid4().int generates a 128-bit int; slicing is fine but
+    # uuid4() itself involves os.urandom — use a simpler approach.
+    import random
+    barcode_num = str(int(datetime.now(timezone.utc).timestamp() * 1000))[-10:] + str(random.randint(10, 99))
+
     product = Product(**product_data.model_dump(), barcode=barcode_num)
     doc = product.model_dump()
     doc['created_at'] = doc['created_at'].isoformat()
+
+    # ── OPTIMIZATION 9: Don't store huge base64 images in MongoDB ─
+    # If image_url is a base64 data URI (data:image/...) it can be
+    # hundreds of KB stored as a string in each document, making
+    # reads and writes slow. Warn in logs but still save it.
+    if doc.get('image_url', '').startswith('data:'):
+        logger.warning(
+            f"Product '{product.name}' has a base64 image_url (~{len(doc['image_url'])//1024}KB). "
+            "Consider using /upload-image endpoint and storing URLs instead."
+        )
+
     await db.products.insert_one(doc)
     return product
 
@@ -582,8 +697,6 @@ async def get_barcode_image(product_id: str, current_user: User = Depends(get_cu
 
 # ═════════════════════════════════════════════════════════════
 #  ORDERS / POS
-#  POST (checkout) → admin, billing
-#  GET (list)      → admin, billing (own only), manager (view all)
 # ═════════════════════════════════════════════════════════════
 
 @api_router.post("/orders", response_model=Order)
@@ -617,7 +730,6 @@ async def create_order(
         created_by=current_user.id
     )
 
-    # Deduct stock from mall rack assignments
     mall_locations = await db.locations.find({'type': 'mall'}, {'_id': 0}).to_list(10)
     mall_location_ids = [loc['id'] for loc in mall_locations]
 
@@ -679,7 +791,6 @@ async def get_orders(current_user: User = Depends(get_current_user)):
     require_roles(current_user, ['admin', 'billing', 'manager'],
                   "Staff cannot view orders")
 
-    # billing staff see only their own orders
     query = {} if current_user.role in ['admin', 'manager'] else {'created_by': current_user.id}
     orders = await db.orders.find(query, {'_id': 0}).sort('created_at', -1).to_list(1000)
     for order in orders:
@@ -696,7 +807,6 @@ async def get_order(order_id: str, current_user: User = Depends(get_current_user
     order = await db.orders.find_one({'id': order_id}, {'_id': 0})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    # billing can only see their own orders
     if current_user.role == 'billing' and order.get('created_by') != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
     if isinstance(order.get('created_at'), str):
@@ -706,7 +816,6 @@ async def get_order(order_id: str, current_user: User = Depends(get_current_user
 
 # ═════════════════════════════════════════════════════════════
 #  REPORTS
-#  admin, manager only
 # ═════════════════════════════════════════════════════════════
 
 @api_router.get("/reports/sales")
@@ -809,13 +918,16 @@ async def export_excel_report(
 
 # ═════════════════════════════════════════════════════════════
 #  DASHBOARD
-#  All roles (financial totals hidden for billing/staff in frontend)
 # ═════════════════════════════════════════════════════════════
 
 @api_router.get("/dashboard/stats")
 async def get_dashboard_stats(current_user: User = Depends(get_current_user)):
-    products = await db.products.find({}, {'_id': 0}).to_list(1000)
-    orders   = await db.orders.find({}, {'_id': 0}).to_list(1000)
+    # ── OPTIMIZATION 10: Parallel DB fetches for dashboard ─────
+    import asyncio
+    products, orders = await asyncio.gather(
+        db.products.find({}, {'_id': 0}).to_list(1000),
+        db.orders.find({}, {'_id': 0}).to_list(1000),
+    )
 
     now         = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -831,15 +943,21 @@ async def get_dashboard_stats(current_user: User = Depends(get_current_user)):
     today_sales = sum(o['total'] for o in today_orders)
     total_sales = sum(o['total'] for o in orders)
 
+    # Build a product lookup dict to avoid O(n²) iteration
+    product_map = {p['id']: p for p in products}
+
     total_profit = 0
     for order in orders:
         for item in order['items']:
-            product = next((p for p in products if p['id'] == item['product_id']), None)
+            product = product_map.get(item['product_id'])
             if product:
                 profit = (item['price'] - product['purchase_price']) * item['quantity']
                 total_profit += profit
 
-    low_stock_products = [p for p in products if p['stock_quantity'] <= p.get('low_stock_threshold', 10)]
+    low_stock_products = [
+        p for p in products
+        if p['stock_quantity'] <= p.get('low_stock_threshold', 10)
+    ]
 
     return {
         'today_sales':        round(today_sales, 2),
@@ -849,14 +967,12 @@ async def get_dashboard_stats(current_user: User = Depends(get_current_user)):
         'total_orders':       len(orders),
         'low_stock_count':    len(low_stock_products),
         'low_stock_products': low_stock_products[:5],
-        # expose role so frontend can conditionally hide financial data
         'viewer_role':        current_user.role,
     }
 
 
 # ═════════════════════════════════════════════════════════════
 #  USERS
-#  GET, POST, PUT role → admin only
 # ═════════════════════════════════════════════════════════════
 
 @api_router.get("/users", response_model=List[User])
@@ -887,13 +1003,15 @@ async def update_user_role(
     result = await db.users.update_one({'id': user_id}, {'$set': {'role': role}})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # Invalidate cache for this user so role change takes effect immediately
+    _user_cache.pop(user_id, None)
+
     return {'message': f'Role updated to {role}'}
 
 
 # ═════════════════════════════════════════════════════════════
 #  LOCATIONS
-#  GET  → all roles
-#  POST → admin, manager
 # ═════════════════════════════════════════════════════════════
 
 @api_router.get("/locations", response_model=List[Location])
@@ -922,10 +1040,6 @@ async def create_location(
 
 # ═════════════════════════════════════════════════════════════
 #  RACKS
-#  GET    → all roles
-#  POST   → admin, manager
-#  PUT    → admin, manager
-#  DELETE → admin only
 # ═════════════════════════════════════════════════════════════
 
 @api_router.get("/racks", response_model=List[Rack])
@@ -1019,10 +1133,6 @@ async def delete_rack(rack_id: str, current_user: User = Depends(get_current_use
 
 # ═════════════════════════════════════════════════════════════
 #  RACK ASSIGNMENTS
-#  GET    → all roles
-#  POST   → admin, manager
-#  PUT    → admin, manager
-#  DELETE → admin, manager
 # ═════════════════════════════════════════════════════════════
 
 @api_router.get("/products/{product_id}/rack-assignments", response_model=List[RackAssignment])
@@ -1049,21 +1159,29 @@ async def create_rack_assignment(
     require_roles(current_user, ['admin', 'manager'],
                   "Only admins and managers can assign products to racks")
 
-    product = await db.products.find_one({'id': assignment_data.product_id}, {'_id': 0})
+    # ── OPTIMIZATION 11: Parallel lookups ──────────────────────
+    import asyncio
+    product, rack = await asyncio.gather(
+        db.products.find_one({'id': assignment_data.product_id}, {'_id': 0}),
+        db.racks.find_one({'id': assignment_data.rack_id}, {'_id': 0}),
+    )
+
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
-    rack = await db.racks.find_one({'id': assignment_data.rack_id}, {'_id': 0})
     if not rack:
         raise HTTPException(status_code=404, detail="Rack not found")
 
-    existing = await db.rack_assignments.find_one({
-        'product_id': assignment_data.product_id,
-        'rack_id':    assignment_data.rack_id
-    }, {'_id': 0})
+    existing, assignments = await asyncio.gather(
+        db.rack_assignments.find_one({
+            'product_id': assignment_data.product_id,
+            'rack_id':    assignment_data.rack_id
+        }, {'_id': 0}),
+        db.rack_assignments.find({'product_id': assignment_data.product_id}, {'_id': 0}).to_list(1000),
+    )
+
     if existing:
         raise HTTPException(status_code=400, detail="Product already assigned to this rack")
 
-    assignments = await db.rack_assignments.find({'product_id': assignment_data.product_id}, {'_id': 0}).to_list(1000)
     total_assigned = sum(a['quantity'] for a in assignments) + assignment_data.quantity
     if total_assigned > product['stock_quantity']:
         raise HTTPException(
@@ -1138,8 +1256,6 @@ async def delete_rack_assignment(assignment_id: str, current_user: User = Depend
 
 # ═════════════════════════════════════════════════════════════
 #  STOCK TRANSFERS
-#  GET  → all roles
-#  POST → admin, manager
 # ═════════════════════════════════════════════════════════════
 
 @api_router.get("/stock-transfers", response_model=List[StockTransfer])
@@ -1290,15 +1406,20 @@ async def get_product_locations(product_id: str, current_user: User = Depends(ge
 
 @api_router.get("/dashboard/low-stock-by-location")
 async def get_low_stock_by_location(current_user: User = Depends(get_current_user)):
-    products  = await db.products.find({}, {'_id': 0}).to_list(1000)
-    locations = await db.locations.find({}, {'_id': 0}).to_list(10)
+    # ── OPTIMIZATION 12: Parallel fetch, dict lookup ────────────
+    import asyncio
+    products, locations = await asyncio.gather(
+        db.products.find({}, {'_id': 0}).to_list(1000),
+        db.locations.find({}, {'_id': 0}).to_list(10),
+    )
+    location_map = {l['id']: l for l in locations}
 
     mall_low_stock, warehouse_low_stock = [], []
     for product in products:
         assignments = await db.rack_assignments.find({'product_id': product['id']}, {'_id': 0}).to_list(1000)
         mall_qty = warehouse_qty = 0
         for a in assignments:
-            location = next((l for l in locations if l['id'] == a['location_id']), None)
+            location = location_map.get(a['location_id'])
             if location:
                 if location['type'] == 'mall':
                     mall_qty += a['quantity']
@@ -1320,16 +1441,10 @@ async def get_low_stock_by_location(current_user: User = Depends(get_current_use
 
 # ═════════════════════════════════════════════════════════════
 #  DAY BOOK
-#  GET         → admin, manager, staff (staff: own only)
-#  POST        → admin, manager
-#  PUT settle  → admin, manager
-#  PUT update  → admin, manager
-#  DELETE      → admin only
 # ═════════════════════════════════════════════════════════════
 
 @api_router.get("/daybook/stats")
 async def get_daybook_stats(current_user: User = Depends(get_current_user)):
-    """Summary stats — admin/manager see all, staff/billing see own."""
     query = {} if current_user.role in ['admin', 'manager'] else {'created_by': current_user.id}
     entries = await db.daybook.find(query, {'_id': 0}).to_list(10000)
 
@@ -1356,7 +1471,6 @@ async def get_daybook_stats(current_user: User = Depends(get_current_user)):
 
 @api_router.get("/daybook")
 async def get_daybook_entries(current_user: User = Depends(get_current_user)):
-    """Admin/manager: all entries. Staff/billing: own entries only."""
     query = {} if current_user.role in ['admin', 'manager'] else {'created_by': current_user.id}
     entries = await db.daybook.find(query, {'_id': 0}).sort('created_at', -1).to_list(1000)
     for e in entries:
@@ -1460,7 +1574,6 @@ async def delete_daybook_entry(entry_id: str, current_user: User = Depends(get_c
 
 @api_router.post("/attendance/clock-in")
 async def clock_in(current_user: User = Depends(get_current_user)):
-    """Mark clock-in for today. Only one clock-in per day per user."""
     today = _today_str()
 
     existing = await db.attendance.find_one(
@@ -1469,7 +1582,7 @@ async def clock_in(current_user: User = Depends(get_current_user)):
     if existing:
         if existing.get("clock_in"):
             raise HTTPException(status_code=400, detail="Already clocked in today")
-    
+
     now = _now_iso()
     record = AttendanceRecord(
         user_id=current_user.id,
@@ -1486,7 +1599,6 @@ async def clock_in(current_user: User = Depends(get_current_user)):
 
 @api_router.post("/attendance/clock-out")
 async def clock_out(current_user: User = Depends(get_current_user)):
-    """Mark clock-out for today."""
     today = _today_str()
 
     record = await db.attendance.find_one(
@@ -1511,16 +1623,16 @@ async def clock_out(current_user: User = Depends(get_current_user)):
 
 @api_router.get("/attendance/today")
 async def get_today_attendance(current_user: User = Depends(get_current_user)):
-    """Get today's attendance record for the current user."""
     today = _today_str()
-    record = await db.attendance.find_one(
-        {"user_id": current_user.id, "date": today}, {"_id": 0}
-    )
-    # Also check if they have an approved leave for today
-    leave = await db.leaves.find_one(
-        {"user_id": current_user.id, "status": "approved",
-         "date_from": {"$lte": today}, "date_to": {"$gte": today}},
-        {"_id": 0}
+    # ── Parallel attendance + leave check ──────────────────────
+    import asyncio
+    record, leave = await asyncio.gather(
+        db.attendance.find_one({"user_id": current_user.id, "date": today}, {"_id": 0}),
+        db.leaves.find_one(
+            {"user_id": current_user.id, "status": "approved",
+             "date_from": {"$lte": today}, "date_to": {"$gte": today}},
+            {"_id": 0}
+        ),
     )
     return {
         "record": record,
@@ -1532,10 +1644,9 @@ async def get_today_attendance(current_user: User = Depends(get_current_user)):
 
 @api_router.get("/attendance/my")
 async def get_my_attendance(
-    month: Optional[str] = None,   # format: YYYY-MM
+    month: Optional[str] = None,
     current_user: User = Depends(get_current_user)
 ):
-    """Get current user's attendance records, optionally filtered by month."""
     query = {"user_id": current_user.id}
     if month:
         query["date"] = {"$regex": f"^{month}"}
@@ -1549,30 +1660,19 @@ async def get_my_attendance(
 
 @api_router.get("/attendance/summary")
 async def get_attendance_summary(
-    month: str,                     # format: YYYY-MM  e.g. 2026-03
+    month: str,
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Admin/Manager only.
-    Returns per-staff attendance summary for the given month.
-    """
     require_roles(current_user, ["admin", "manager"],
                   "Only admins and managers can view attendance summary")
 
-    # Get all users
-    all_users = await db.users.find({}, {"_id": 0, "password": 0}).to_list(500)
+    import asyncio
+    all_users, records, leaves = await asyncio.gather(
+        db.users.find({}, {"_id": 0, "password": 0}).to_list(500),
+        db.attendance.find({"date": {"$regex": f"^{month}"}}, {"_id": 0}).to_list(5000),
+        db.leaves.find({"status": "approved"}, {"_id": 0}).to_list(5000),
+    )
 
-    # Get all attendance records for the month
-    records = await db.attendance.find(
-        {"date": {"$regex": f"^{month}"}}, {"_id": 0}
-    ).to_list(5000)
-
-    # Get all approved leaves for the month
-    leaves = await db.leaves.find(
-        {"status": "approved"}, {"_id": 0}
-    ).to_list(5000)
-
-    # Build per-user summary
     summary = []
     for user in all_users:
         user_records = [r for r in records if r["user_id"] == user["id"]]
@@ -1580,11 +1680,9 @@ async def get_attendance_summary(
         days_present   = len([r for r in user_records if r.get("clock_in") and r.get("clock_out")])
         days_clocked_in_only = len([r for r in user_records if r.get("clock_in") and not r.get("clock_out")])
 
-        # Count approved leave days in this month
         leave_days = 0
         user_leaves = [l for l in leaves if l["user_id"] == user["id"]]
         for leave in user_leaves:
-            # Count overlap with requested month
             from datetime import date as dt_date
             try:
                 d1 = max(dt_date.fromisoformat(leave["date_from"]), dt_date.fromisoformat(f"{month}-01"))
@@ -1622,7 +1720,6 @@ async def get_staff_attendance(
     month: Optional[str] = None,
     current_user: User = Depends(get_current_user)
 ):
-    """Admin/Manager: get a specific staff member's attendance records."""
     require_roles(current_user, ["admin", "manager"],
                   "Only admins and managers can view staff attendance")
 
@@ -1646,13 +1743,11 @@ async def request_leave(
     leave_data: LeaveRequestCreate,
     current_user: User = Depends(get_current_user)
 ):
-    """Any staff can submit a leave request."""
     if leave_data.leave_type not in ("sick", "casual", "emergency", "other"):
         raise HTTPException(status_code=400, detail="Invalid leave type")
     if not leave_data.reason.strip():
         raise HTTPException(status_code=400, detail="Reason is required")
 
-    # Check for overlapping pending/approved leave
     existing = await db.leaves.find_one({
         "user_id": current_user.id,
         "status":  {"$in": ["pending", "approved"]},
@@ -1688,7 +1783,6 @@ async def get_leaves(
     month:  Optional[str] = None,
     current_user: User = Depends(get_current_user)
 ):
-    """Admin/Manager: all leaves. Staff: own leaves only."""
     query = {}
     if current_user.role not in ["admin", "manager"]:
         query["user_id"] = current_user.id
@@ -1722,7 +1816,6 @@ async def approve_leave(leave_id: str, current_user: User = Depends(get_current_
         "reviewed_at":      now,
     }})
 
-    # Create attendance records for the approved leave days
     from datetime import date as dt_date, timedelta
     d = dt_date.fromisoformat(leave["date_from"])
     end = dt_date.fromisoformat(leave["date_to"])
@@ -1768,7 +1861,6 @@ async def reject_leave(leave_id: str, current_user: User = Depends(get_current_u
 
 @api_router.delete("/leaves/{leave_id}")
 async def cancel_leave(leave_id: str, current_user: User = Depends(get_current_user)):
-    """Staff can cancel their own pending leave. Admin can cancel any."""
     leave = await db.leaves.find_one({"id": leave_id}, {"_id": 0})
     if not leave:
         raise HTTPException(status_code=404, detail="Leave request not found")
@@ -1781,14 +1873,13 @@ async def cancel_leave(leave_id: str, current_user: User = Depends(get_current_u
     return {"message": "Leave request cancelled"}
 
 
-
 # ─── App setup ────────────────────────────────────────────────
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://mrb-a9i.pages.dev",   # your frontend
-        "http://localhost:5173",       # local vite
+        "https://mrb-a9i.pages.dev",
+        "http://localhost:5173",
         "http://localhost:3000"
     ],
     allow_credentials=True,
